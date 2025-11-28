@@ -1,0 +1,402 @@
+import express from 'express';
+import cors from 'cors';
+import { createClient } from '@supabase/supabase-js';
+
+const app = express();
+app.use(cors());
+app.use(express.json());
+
+const PORT = 3001;
+
+async function verifyAdmin(req, res, next) {
+  const authHeader = req.headers.authorization;
+  if (!authHeader || !authHeader.startsWith('Bearer ')) {
+    return res.status(401).json({ success: false, error: 'Unauthorized - Token required' });
+  }
+
+  const token = authHeader.split(' ')[1];
+  const supabaseUrl = process.env.VITE_SUPABASE_URL;
+  const supabaseServiceKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
+
+  if (!supabaseUrl || !supabaseServiceKey) {
+    return res.status(500).json({ success: false, error: 'Supabase not configured' });
+  }
+
+  const supabase = createClient(supabaseUrl, supabaseServiceKey);
+  
+  const { data: { user }, error: authError } = await supabase.auth.getUser(token);
+  if (authError || !user) {
+    return res.status(401).json({ success: false, error: 'Invalid token' });
+  }
+
+  const adminEmails = (process.env.VITE_ADMIN_EMAILS || '').split(',').map(e => e.trim());
+  if (!adminEmails.includes(user.email)) {
+    return res.status(403).json({ success: false, error: 'Admin access required' });
+  }
+
+  req.user = user;
+  next();
+}
+
+app.post('/api/ai/fetch-fixtures', verifyAdmin, async (req, res) => {
+  try {
+    const rapidApiKey = process.env.RAPIDAPI_KEY;
+
+    if (!rapidApiKey) {
+      console.error('RapidAPI key not configured');
+      return res.status(500).json({ 
+        success: false, 
+        error: 'RapidAPI key not configured' 
+      });
+    }
+
+    const { league, limit = 100 } = req.body;
+    const today = new Date().toISOString().split('T')[0];
+    const now = new Date();
+
+    const topLeagueIds = [
+      2,    // UEFA Champions League
+      3,    // UEFA Europa League
+      848,  // UEFA Europa Conference League
+      39,   // Premier League (England)
+      140,  // La Liga (Spain)
+      135,  // Serie A (Italy)
+      78,   // Bundesliga (Germany)
+      61,   // Ligue 1 (France)
+      94,   // Primeira Liga (Portugal)
+      88,   // Eredivisie (Netherlands)
+      144,  // Belgian Pro League
+      203,  // Super Lig (Turkey)
+      1,    // World Cup / International
+      4,    // Euro
+    ];
+
+    let url = `https://api-football-v1.p.rapidapi.com/v3/fixtures?date=${today}`;
+    if (league) {
+      url += `&league=${league}`;
+    }
+
+    console.log(`Fetching fixtures from: ${url}`);
+
+    const response = await fetch(url, {
+      method: 'GET',
+      headers: {
+        'X-RapidAPI-Key': rapidApiKey,
+        'X-RapidAPI-Host': 'api-football-v1.p.rapidapi.com'
+      }
+    });
+
+    const data = await response.json();
+
+    if (!response.ok) {
+      console.error('RapidAPI error:', data);
+      return res.status(response.status).json({ 
+        success: false, 
+        error: data.message || 'API Football error',
+        details: data
+      });
+    }
+
+    const allFixtures = data.response || [];
+    
+    const upcomingFixtures = allFixtures.filter(fixture => {
+      const fixtureDate = new Date(fixture.fixture?.date);
+      const status = fixture.fixture?.status?.short;
+      const isUpcoming = status === 'NS' || status === 'TBD';
+      const isFuture = fixtureDate > now;
+      return isUpcoming && isFuture;
+    });
+
+    const topLeagueFixtures = upcomingFixtures.filter(f => 
+      topLeagueIds.includes(f.league?.id)
+    );
+    
+    const otherFixtures = upcomingFixtures.filter(f => 
+      !topLeagueIds.includes(f.league?.id)
+    );
+
+    const sortByTime = (a, b) => new Date(a.fixture?.date) - new Date(b.fixture?.date);
+    topLeagueFixtures.sort(sortByTime);
+    otherFixtures.sort(sortByTime);
+
+    const prioritizedFixtures = [...topLeagueFixtures, ...otherFixtures].slice(0, limit);
+
+    console.log(`Total: ${allFixtures.length}, Upcoming: ${upcomingFixtures.length}, Top leagues: ${topLeagueFixtures.length}, Returning: ${prioritizedFixtures.length}`);
+
+    return res.status(200).json({
+      success: true,
+      count: prioritizedFixtures.length,
+      totalFetched: allFixtures.length,
+      upcomingCount: upcomingFixtures.length,
+      topLeagueCount: topLeagueFixtures.length,
+      date: today,
+      fixtures: prioritizedFixtures
+    });
+
+  } catch (error) {
+    console.error('Fetch fixtures error:', error);
+    return res.status(500).json({ 
+      success: false, 
+      error: 'Failed to fetch fixtures',
+      details: error.message
+    });
+  }
+});
+
+app.post('/api/ai/generate-pronos', verifyAdmin, async (req, res) => {
+  try {
+    const openrouterKey = process.env.OPENROUTER_API_KEY;
+    const supabaseUrl = process.env.VITE_SUPABASE_URL;
+    const supabaseServiceKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
+
+    if (!openrouterKey) {
+      return res.status(500).json({ 
+        success: false, 
+        error: 'OpenRouter API key not configured' 
+      });
+    }
+
+    const { fixtures, autoPublish = false } = req.body;
+
+    if (!fixtures || !Array.isArray(fixtures) || fixtures.length === 0) {
+      return res.status(400).json({
+        success: false,
+        error: 'No fixtures provided'
+      });
+    }
+
+    console.log(`Generating pronos for ${fixtures.length} fixtures`);
+
+    const fixturesForAnalysis = fixtures.map(f => ({
+      id: f.fixture?.id,
+      date: f.fixture?.date,
+      home_team: f.teams?.home?.name,
+      away_team: f.teams?.away?.name,
+      league: f.league?.name,
+      country: f.league?.country
+    }));
+
+    const aiResponse = await fetch('https://openrouter.ai/api/v1/chat/completions', {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${openrouterKey}`,
+        'Content-Type': 'application/json',
+        'HTTP-Referer': req.headers.origin || 'https://fixedpronos.com',
+        'X-Title': 'FixedPronos AI'
+      },
+      body: JSON.stringify({
+        model: 'openai/gpt-4.1-mini',
+        messages: [
+          {
+            role: 'system',
+            content: `Tu es un expert en pronostics sportifs. Génère EXACTEMENT 10 pronostics pour les matchs fournis.
+
+CRITÈRES DE SÉLECTION:
+1. PRIORITÉ ABSOLUE aux grandes compétitions: Champions League, Europa League, Premier League, La Liga, Serie A, Bundesliga, Ligue 1
+2. VARIER les horaires: choisis des matchs à différentes heures pour couvrir toute la journée
+3. Équipes connues uniquement
+
+RELATION COTE-CONFIANCE (TRÈS IMPORTANT):
+- Cote 1.20-1.50 = confidence 5 (très sûr, pari safe)
+- Cote 1.51-1.80 = confidence 4-5 (sûr, pari safe)
+- Cote 1.81-2.20 = confidence 3 (moyen, pari vip)
+- Cote 2.21-3.00 = confidence 2 (risqué, pari risk)
+- Cote 3.01-5.00 = confidence 1 (très risqué, pari risk)
+
+STRUCTURE JSON OBLIGATOIRE:
+{
+  "pronos": [
+    {
+      "fixture_id": 123456,
+      "home_team": "Real Madrid",
+      "away_team": "Barcelona",
+      "competition": "La Liga",
+      "sport": "football",
+      "tip": "Victoire Real Madrid",
+      "odd": 1.45,
+      "confidence": 5,
+      "prono_type": "safe",
+      "analysis": "Real Madrid en forme à domicile avec 5 victoires consécutives.",
+      "title": "El Clasico: Les Madrilènes favoris"
+    }
+  ]
+}
+
+RÈGLES:
+- Génère EXACTEMENT 10 pronostics variés
+- VARIE les cotes: inclus des paris à faible cote (1.20-1.60) ET des paris à cote élevée (2.50-4.00)
+- La confiance DOIT correspondre à la cote selon le tableau ci-dessus
+- prono_type: "safe" si confidence>=4, "risk" si confidence<=2, sinon "vip"
+- Varie les types de paris: 1X2, Plus/Moins de buts, BTTS, Double chance, etc.
+- RETOURNE UNIQUEMENT LE JSON, rien d'autre`
+          },
+          {
+            role: 'user',
+            content: `Génère 10 pronostics pour ces matchs:\n${JSON.stringify(fixturesForAnalysis, null, 2)}`
+          }
+        ],
+        temperature: 0.5,
+        max_tokens: 4000
+      })
+    });
+
+    const aiData = await aiResponse.json();
+
+    if (!aiResponse.ok) {
+      console.error('OpenRouter API error:', aiData);
+      return res.status(500).json({
+        success: false,
+        error: 'AI analysis failed',
+        details: aiData.error?.message || 'Unknown error'
+      });
+    }
+
+    let generatedPronos;
+    try {
+      const content = aiData.choices[0]?.message?.content || '';
+      console.log('AI raw response:', content.substring(0, 500));
+      
+      let cleanContent = content
+        .replace(/```json\n?/g, '')
+        .replace(/```\n?/g, '')
+        .trim();
+      
+      const jsonMatch = cleanContent.match(/\{[\s\S]*"pronos"[\s\S]*\}/);
+      if (jsonMatch) {
+        cleanContent = jsonMatch[0];
+      }
+      
+      generatedPronos = JSON.parse(cleanContent);
+      
+      if (!generatedPronos.pronos) {
+        generatedPronos = { pronos: Array.isArray(generatedPronos) ? generatedPronos : [] };
+      }
+    } catch (parseError) {
+      console.error('Failed to parse AI response:', aiData.choices[0]?.message?.content);
+      console.error('Parse error:', parseError.message);
+      return res.status(500).json({
+        success: false,
+        error: 'Failed to parse AI response',
+        details: parseError.message,
+        rawResponse: aiData.choices[0]?.message?.content?.substring(0, 1000)
+      });
+    }
+
+    console.log(`AI generated ${generatedPronos.pronos?.length || 0} pronos`);
+
+    const validatedPronos = [];
+    const validPronoTypes = ['safe', 'risk', 'vip'];
+    
+    for (const prono of (generatedPronos.pronos || [])) {
+      if (!prono.home_team || !prono.away_team || !prono.tip || !prono.title) {
+        console.warn('Skipping prono with missing required fields:', prono);
+        continue;
+      }
+      
+      const odd = parseFloat(prono.odd) || 1.50;
+      const confidence = parseInt(prono.confidence) || 3;
+      
+      const validOdd = Math.max(1.10, Math.min(10.0, odd));
+      const validConfidence = Math.max(1, Math.min(5, confidence));
+      
+      let pronoType = prono.prono_type?.toLowerCase();
+      if (!validPronoTypes.includes(pronoType)) {
+        pronoType = validConfidence >= 4 ? 'safe' : validConfidence <= 2 ? 'risk' : 'vip';
+      }
+      
+      let accessTier;
+      if (validConfidence >= 4) {
+        accessTier = 'free';
+      } else if (validConfidence === 3) {
+        accessTier = 'basic';
+      } else if (validConfidence === 2) {
+        accessTier = 'pro';
+      } else {
+        accessTier = 'vip';
+      }
+      
+      validatedPronos.push({
+        ...prono,
+        odd: validOdd,
+        confidence: validConfidence,
+        prono_type: pronoType,
+        access_tier: accessTier
+      });
+    }
+
+    if (validatedPronos.length === 0) {
+      return res.status(400).json({
+        success: false,
+        error: 'No valid pronos generated',
+        details: 'AI response did not contain valid prono data'
+      });
+    }
+
+    console.log(`Validated ${validatedPronos.length} pronos`);
+
+    if (autoPublish && validatedPronos.length > 0) {
+      const supabase = createClient(supabaseUrl, supabaseServiceKey);
+      
+      const pronosToInsert = validatedPronos.map(prono => ({
+        home_team: prono.home_team,
+        away_team: prono.away_team,
+        competition: prono.competition || 'Football',
+        sport: prono.sport || 'football',
+        tip: prono.tip,
+        odd: prono.odd,
+        confidence: prono.confidence,
+        prono_type: prono.prono_type,
+        access_tier: prono.access_tier,
+        analysis: prono.analysis || '',
+        title: prono.title,
+        match_time: fixtures.find(f => f.fixture?.id === prono.fixture_id)?.fixture?.date || new Date().toISOString(),
+        status: 'published',
+        published_at: new Date().toISOString(),
+        result: 'pending'
+      }));
+
+      const { data: insertedPronos, error: insertError } = await supabase
+        .from('pronos')
+        .insert(pronosToInsert)
+        .select();
+
+      if (insertError) {
+        console.error('Failed to insert pronos:', insertError);
+        return res.status(500).json({
+          success: false,
+          error: 'Failed to save pronos to database',
+          details: insertError.message,
+          generatedPronos: validatedPronos
+        });
+      }
+
+      console.log(`Successfully published ${insertedPronos.length} pronos`);
+
+      return res.status(200).json({
+        success: true,
+        published: true,
+        count: insertedPronos.length,
+        pronos: insertedPronos
+      });
+    }
+
+    return res.status(200).json({
+      success: true,
+      published: false,
+      count: validatedPronos.length,
+      pronos: validatedPronos
+    });
+
+  } catch (error) {
+    console.error('Generate pronos error:', error);
+    return res.status(500).json({ 
+      success: false, 
+      error: 'Failed to generate pronos',
+      details: error.message
+    });
+  }
+});
+
+app.listen(PORT, '0.0.0.0', () => {
+  console.log(`AI API server running on port ${PORT}`);
+});
