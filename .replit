@@ -1,0 +1,92 @@
+modules = ["nodejs-20", "web", "postgresql-16"]
+[agent]
+expertMode = true
+integrations = ["javascript_database:1.0.0"]
+
+[nix]
+channel = "stable-25_05"
+
+[deployment]
+deploymentTarget = "autoscale"
+run = ["npm", "run", "start"]
+build = ["npm", "run", "build"]
+
+[workflows]
+runButton = "Project"
+
+[[workflows.workflow]]
+name = "Project"
+mode = "parallel"
+author = "agent"
+
+[[workflows.workflow.tasks]]
+task = "workflow.run"
+args = "Start application"
+
+[[workflows.workflow.tasks]]
+task = "workflow.run"
+args = "API Server"
+
+[[workflows.workflow]]
+name = "Start application"
+author = "agent"
+
+[[workflows.workflow.tasks]]
+task = "shell.exec"
+args = "npm run dev"
+waitForPort = 5000
+
+[workflows.workflow.metadata]
+outputType = "webview"
+
+[[workflows.workflow]]
+name = "API Server"
+author = "agent"
+
+[[workflows.workflow.tasks]]
+task = "shell.exec"
+args = "node server/index.js"
+waitForPort = 3001
+
+[workflows.workflow.metadata]
+outputType = "console"
+
+[[ports]]
+localPort = 3001
+externalPort = 3001
+
+[[ports]]
+localPort = 5000
+externalPort = 80
+
+[[ports]]
+localPort = 5001
+externalPort = 3001
+
+[[ports]]
+localPort = 36141
+externalPort = 3003
+
+[[ports]]
+localPort = 40735
+externalPort = 5000
+
+[[ports]]
+localPort = 41873
+externalPort = 3002
+
+[[ports]]
+localPort = 45575
+externalPort = 3000
+
+[[ports]]
+localPort = 46429
+externalPort = 4200
+
+[userenv]
+
+[userenv.shared]
+VITE_ADMIN_EMAILS = "marious10102002@gmail.com"
+MONEYFUSION_API_URL = "https://www.pay.moneyfusion.net/fixedapp/53c47152846ca6e2/pay/"
+MONEYFUSION_API_KEY = "moneyfusion_v1_69237604271779ae27e01ecb_D5D8D046E35E3739505A8BC2537139115DB967282B94C0C5BFD365B45895E3C3"
+SUPABASE_SERVICE_ROLE_KEY = "sb_secret_i7fkdeBZo6XD8MecsDXiHg_vmUS6gMv"
